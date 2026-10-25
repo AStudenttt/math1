@@ -5,11 +5,15 @@
   连续性回顾 → 一致连续定义 → 几何意义 → 例题 → 否定形式与反例
   → 最大 δ(x0) 的下界 → 一致连续性定理（Cantor 定理）及证明 → 小结
 
-依赖：numpy, matplotlib, ffmpeg
-用法：python3 make_video.py [--out uniform_continuity.mp4] [--fps 30] [--scene N] [--preview]
+依赖：numpy, matplotlib, ffmpeg（配音另需 soundfile，见 tts.py）
+用法：
+  python3 tts.py --model-dir <Kokoro 模型目录>   # 可选：先离线合成配音到 audio/
+  python3 make_video.py [--out uniform_continuity.mp4] [--fps 30] [--scene N] [--preview]
+有 audio/durations.json 时，各段时长会按配音长度自动拉伸，并把配音混入视频
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -22,6 +26,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import FancyBboxPatch, Rectangle
+
+# ---------------------------------------------------------------- 配音（由 tts.py 生成，可选）
+HERE = os.path.dirname(os.path.abspath(__file__))
+AUDIO_DIR = os.path.join(HERE, "audio")
+LEAD, TAIL = 0.3, 0.6  # 每段配音前的留白、后的停顿（秒）
+try:
+    with open(os.path.join(AUDIO_DIR, "durations.json")) as _fh:
+        AUDIO_DURATIONS = json.load(_fh)
+except FileNotFoundError:
+    AUDIO_DURATIONS = {}
 
 # ---------------------------------------------------------------- 样式
 W, H, DPI = 1280, 720, 100
@@ -76,9 +90,13 @@ class Scene:
     subs = []  # [(时长秒, 字幕文本)]
 
     def __init__(self):
+        # 有配音时，每段时长取“预设时长”与“配音时长+留白”中的较大者
+        audio = AUDIO_DURATIONS.get(type(self).__name__, [])
+        self.segs = [(max(d, LEAD + audio[i] + TAIL) if i < len(audio) else d, text)
+                     for i, (d, text) in enumerate(self.subs)]
         self.starts = []
         acc = 0.0
-        for d, _ in self.subs:
+        for d, _ in self.segs:
             self.starts.append(acc)
             acc += d
         self.duration = acc
@@ -95,7 +113,7 @@ class Scene:
         """标题与底部字幕"""
         if self.title:
             fig.text(0.035, 0.945, self.title, fontsize=17, color=DIM, va="center")
-        for i, (d, s) in enumerate(self.subs):
+        for i, (d, s) in enumerate(self.segs):
             t0 = self.starts[i]
             if t0 <= t < t0 + d:
                 a = fade(t, t0, t0 + d, 0.25)
@@ -787,7 +805,7 @@ def render_scene(args):
     idx, fps, outdir = args
     scene = SCENES[idx]()
     path = os.path.join(outdir, f"scene_{idx:02d}.mp4")
-    n = int(round(scene.duration * fps))
+    n = scene_frames(scene, fps)
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
            "-s", f"{W}x{H}", "-r", str(fps), "-i", "-", "-c:v", "libx264", "-preset", "medium",
            "-crf", "20", "-pix_fmt", "yuv420p", path]
@@ -800,6 +818,38 @@ def render_scene(args):
     return path
 
 
+def scene_frames(scene, fps):
+    return int(round(scene.duration * fps))
+
+
+def build_audio(idxs, fps, path, sr=24000):
+    """按各字幕段的起始时刻拼接配音，返回是否生成了音轨"""
+    import soundfile as sf
+
+    if not AUDIO_DURATIONS:
+        return False
+    scenes = [SCENES[i]() for i in idxs]
+    total = sum(scene_frames(sc, fps) for sc in scenes) / fps
+    track = np.zeros(int(total * sr) + sr, dtype=np.float32)
+    base = 0.0
+    for sc in scenes:
+        name = type(sc).__name__
+        for j, st in enumerate(sc.starts):
+            wav = os.path.join(AUDIO_DIR, f"{name}_{j}.wav")
+            if not os.path.exists(wav):
+                continue
+            data, rate = sf.read(wav, dtype="float32")
+            assert rate == sr, wav
+            i0 = int((base + st + LEAD) * sr)
+            track[i0:i0 + len(data)] += data
+        base += scene_frames(sc, fps) / fps
+    peak = np.abs(track).max()
+    if peak > 0:
+        track *= 0.89 / peak
+    sf.write(path, track[:int(total * sr)], sr)
+    return True
+
+
 def write_srt(path):
     def ts(x):
         ms = int(round(x * 1000))
@@ -808,7 +858,7 @@ def write_srt(path):
     lines, k, base = [], 1, 0.0
     for S in SCENES:
         s = S()
-        for (d, text), st in zip(s.subs, s.starts):
+        for (d, text), st in zip(s.segs, s.starts):
             lines.append(f"{k}\n{ts(base + st)} --> {ts(base + st + d)}\n{text}\n")
             k += 1
         base += s.duration
@@ -830,7 +880,7 @@ def main():
         os.makedirs("preview", exist_ok=True)
         for i in idxs:
             s = SCENES[i]()
-            for j, (d, _) in enumerate(s.subs):
+            for j, (d, _) in enumerate(s.segs):
                 img = s.frame(s.starts[j] + d * 0.8)
                 plt.imsave(f"preview/s{i + 1:02d}_{j + 1}.png", img)
         print("previews written to preview/")
@@ -844,8 +894,18 @@ def main():
         lst = os.path.join(tmp, "list.txt")
         with open(lst, "w") as fh:
             fh.writelines(f"file '{p}'\n" for p in paths)
+        silent = os.path.join(tmp, "video.mp4")
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-                        "-i", lst, "-c", "copy", "-movflags", "+faststart", a.out], check=True)
+                        "-i", lst, "-c", "copy", silent], check=True)
+        voice = os.path.join(tmp, "voice.wav")
+        if build_audio(idxs, a.fps, voice):
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", silent, "-i", voice,
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                            "-movflags", "+faststart", a.out], check=True)
+        else:
+            print("audio/durations.json 不存在，输出无配音版本")
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", silent, "-c", "copy",
+                            "-movflags", "+faststart", a.out], check=True)
     if not a.scene:
         write_srt(os.path.splitext(a.out)[0] + ".srt")
     print("wrote", a.out)
